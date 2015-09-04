@@ -89,6 +89,10 @@ class Broker():
         self._socket_timeout_ms = socket_timeout_ms
         self._offsets_channel_socket_timeout_ms = offsets_channel_socket_timeout_ms
         self._buffer_size = buffer_size
+        # when multiple consumers are started simultaneously on separate threads,
+        # they all race to connect the offsets channel at once. ensure this
+        # only happens once to avoid race condition.
+        self._offsets_channel_lock = self._handler.Lock()
         self.connect()
 
     def __repr__(self):
@@ -208,14 +212,17 @@ class Broker():
         :class:`pykafka.handlers.RequestHandler` for this broker's offsets
         channel
         """
-        self._offsets_channel_connection = BrokerConnection(
-            self.host, self.port, buffer_size=self._buffer_size,
-            source_host=self._source_host, source_port=self._source_port)
-        self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
-        self._offsets_channel_req_handler = RequestHandler(
-            self._handler, self._offsets_channel_connection
-        )
-        self._offsets_channel_req_handler.start()
+        with self._offsets_channel_lock:
+            if self.offsets_channel_connected:
+                return
+            self._offsets_channel_connection = BrokerConnection(
+                self.host, self.port, buffer_size=self._buffer_size,
+                source_host=self._source_host, source_port=self._source_port)
+            self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+            self._offsets_channel_req_handler = RequestHandler(
+                self._handler, self._offsets_channel_connection
+            )
+            self._offsets_channel_req_handler.start()
 
     def fetch_messages(self,
                        partition_requests,
@@ -318,8 +325,7 @@ class Broker():
             should be committed
         :type preqs: Iterable of :class:`pykafka.protocol.PartitionOffsetCommitRequest`
         """
-        if not self.offsets_channel_connected:
-            self.connect_offsets_channel()
+        self.connect_offsets_channel()
         req = OffsetCommitRequest(consumer_group,
                                   consumer_group_generation_id,
                                   consumer_id,
@@ -338,7 +344,6 @@ class Broker():
             should be fetched
         :type preqs: Iterable of :class:`pykafka.protocol.PartitionOffsetFetchRequest`
         """
-        if not self.offsets_channel_connected:
-            self.connect_offsets_channel()
+        self.connect_offsets_channel()
         req = OffsetFetchRequest(consumer_group, partition_requests=preqs)
         return self._offsets_channel_req_handler.request(req).get(OffsetFetchResponse)
